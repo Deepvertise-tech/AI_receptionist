@@ -5,4 +5,4 @@ thanks!
 
 Overview:
 ---------
-![The overview of the AI receptionist bot](flow.png)
+![The overview of the AI receptionist bot](flow2.png)
