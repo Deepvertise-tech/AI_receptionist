@@ -1,31 +1,15 @@
 {
-  "name": "AI_receptionist",
+  "name": "ai-receptionist",
   "version": "1.0.0",
-  "main": "index.js",
+  "engines": { "node": ">=18" },
+  "main": "server.js",
   "scripts": {
-    "dev": "nodemon --exec ts-node src/server.ts",
-    "build": "tsc",
-    "start": "node dist/server.js"
+    "start": "node server.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
-    "@twilio/voice-sdk": "^2.6.0",
-    "axios": "^1.12.2",
-    "body-parser": "^2.2.0",
     "dotenv": "^17.2.2",
     "express": "^4.21.2",
-    "nodemailer": "^7.0.6",
-    "openai": "^5.23.1",
-    "twilio": "^5.10.1"
-  },
-  "devDependencies": {
-    "@types/express": "^5.0.3",
-    "@types/node": "^24.5.2",
-    "nodemon": "^3.1.10",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.2"
-  },
-  "description": ""
+    "nodemailer": "^6.9.13",
+    "openai": "^4.58.1"
+  }
 }
