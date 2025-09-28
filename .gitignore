@@ -13,7 +13,6 @@ __pycache__/
 .env.development
 
 # Secrets
-*.json
 *.key
 *.pem
 *.crt
