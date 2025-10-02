@@ -1,7 +1,7 @@
 // business.js — business profile & utilities
 
 const BUSINESS = {
-    name: "Bilal's Restaurant",
+    name: "Demo Restaurant",
     phone: "+1 555 0100",
     hours: "Mon–Sat 10:00–22:00, Sun 12:00–20:00",
     address: "123 Sample Street, Berlin",
