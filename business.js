@@ -13,7 +13,7 @@ const BUSINESS = {
       { item: "caesar salad", price: 7.0 },
       { item: "tiramisu", price: 6.5 },
       { item: "Chicken Burger", price: 6.5 },
-      { item: "Chicke Corn Soup", price: 4.5 },
+      { item: "Chicken Corn Soup", price: 4.5 },
       { item: "French Fries", price: 1.5 }
     ],
     policies: {
