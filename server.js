@@ -11,8 +11,9 @@ app.use(express.urlencoded({ extended: true })); // Twilio posts form-encoded
 app.use(express.json());
 
 // ---- Serve Twilio Voice SDK (for browser client) ----
-const twilioSdkPath = require.resolve('@twilio/voice-sdk/dist/twilio.min.js');
-app.get('/sdk/twilio.min.js', (_req, res) => res.sendFile(twilioSdkPath));
+// ✨ FIX: remove node-side resolve of the browser SDK to avoid Render crash
+// const twilioSdkPath = require.resolve('@twilio/voice-sdk/dist/twilio.min.js');
+// app.get('/sdk/twilio.min.js', (_req, res) => res.sendFile(twilioSdkPath));
 
 // ---------- SMTP ----------
 const mailer = nodemailer.createTransport({
@@ -524,7 +525,8 @@ app.get('/client', (_req, res) => {
   <button id="hangup" disabled>Hang up</button>
   <pre id="log" style="height:200px;overflow:auto;background:#f6f6f6;padding:8px"></pre>
 
-  <script src="/sdk/twilio.min.js"></script>
+  <!-- ✨ FIX: use Twilio's CDN for the Voice SDK -->
+  <script src="https://media.twiliocdn.com/sdk/js/voice/releases/2.5.1/twilio.min.js"></script>
   <script>
     const log = (...a)=>{ const el=document.getElementById('log'); el.textContent += a.join(' ')+"\\n"; el.scrollTop = el.scrollHeight; };
     let device, conn;
