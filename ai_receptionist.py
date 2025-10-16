@@ -1,16 +1,10 @@
-# ================================
-# AI Receptionist — Natural v12.3 (Quart)
-# GPT-led conversation, finals-only ASR, sentence streaming,
-# per-call memory (name/phone), immediate barge-in, single-queue streaming TTS
-# + Goodbye-phrase hangup (REST + TwiML fallback) with arming guard
-# ================================
 import os, json, base64, logging, asyncio, time, struct, re, html, unicodedata
 from typing import Optional
 from dotenv import load_dotenv
 from quart import Quart, request, websocket
 from twilio.twiml.voice_response import VoiceResponse
 import azure.cognitiveservices.speech as speechsdk
-import httpx  # HTTP/2 for faster first token
+import httpx 
 
 # ---------- Setup ----------
 load_dotenv()
