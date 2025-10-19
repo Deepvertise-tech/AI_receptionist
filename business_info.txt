@@ -5,7 +5,7 @@ Scheduling Rules (Demo): propose slots 3–4 business days in advance; add a 10-
 Resource Assumption (Demo): 2 staff members (Employee A, Employee B)
 
 [CONTEXT — TODAY’S DATE (BERLIN)]
-- Today is Tuesday, 14 October 2025.
+- Today is Tuesday, 20 October 2025.
 - “3–4 business days ahead” from today means: Friday, 17 October 2025 (3 business days) and Monday, 20 October 2025 (4 business days). Avoid weekends unless the caller explicitly asks.
 
 Seasonal Intelligence:

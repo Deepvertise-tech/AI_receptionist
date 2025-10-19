@@ -4,7 +4,14 @@ from dotenv import load_dotenv
 from quart import Quart, request, websocket
 from twilio.twiml.voice_response import VoiceResponse
 import azure.cognitiveservices.speech as speechsdk
-import httpx 
+import httpx
+
+# ---- NEW: Excel (OpenPyXL) support ----
+try:
+    from openpyxl import Workbook, load_workbook
+    OPENPYXL_AVAILABLE = True
+except Exception:
+    OPENPYXL_AVAILABLE = False
 
 # ---------- Setup ----------
 load_dotenv()
@@ -51,14 +58,49 @@ httpx_client = httpx.AsyncClient(http2=True, timeout=httpx_timeout, headers={
     "Authorization": f"Bearer {OPENAI_API_KEY}",
 })
 
-# ---------- Custom phrases for ASR ----------
-CUSTOM_PHRASES = ["Tikka", "Biryani"]
+# ---------- Env helpers (UTF-8 safe) ----------
+def _env_text(name: str, default: Optional[str] = None) -> Optional[str]:
+    """
+    Read a UTF-8 env var safely (keeps umlauts etc.). Only unescape \n and \t.
+    """
+    val = os.getenv(name)
+    if val is None or val == "":
+        return default
+    return val.replace("\\n", "\n").replace("\\t", "\t")
+
+def _parse_env_list(var_name: str):
+    """
+    Accept JSON array or comma-separated list from .env.
+    Returns list[str]. Missing or empty -> [].
+    """
+    val = os.getenv(var_name, "").strip()
+    if not val:
+        return []
+    if val.startswith("["):
+        try:
+            arr = json.loads(val)
+            return [str(x).strip() for x in arr if str(x).strip()]
+        except Exception:
+            logger.warning(f"[ENV] {var_name} JSON parse failed; falling back to CSV split.")
+    return [x.strip() for x in val.split(",") if x.strip()]
 
 # ---------- Core ----------
 class LowLatencyReceptionist:
     def __init__(self):
         self.business_info = self._load_business_info()
-        self.base_system_prompt = self._base_system_prompt()
+
+        # Optional clamp to avoid very large prompts hurting latency
+        MAX_BIZ = int(os.getenv("BUSINESS_INFO_MAX_CHARS", "12000"))
+        if len(self.business_info) > MAX_BIZ:
+            logger.warning(f"[PROMPT] BUSINESS_INFO truncated from {len(self.business_info)} to {MAX_BIZ} chars")
+            self.business_info = self.business_info[:MAX_BIZ]
+
+        # BASE_SYSTEM_PROMPT comes ONLY from env; expand placeholders
+        raw = _env_text("BASE_SYSTEM_PROMPT", "") or ""
+        raw = raw.replace("{BUSINESS_INFO}", self.business_info)
+        raw = raw.replace("{COMPANY_NAME}", self._company_name())
+        self.base_system_prompt = raw
+        logger.info(f"[PROMPT] base_system_prompt chars={len(self.base_system_prompt)}")
 
     def _load_business_info(self):
         fn = os.getenv("BUSINESS_INFO_FILE", "business_info.txt")
@@ -74,24 +116,6 @@ class LowLatencyReceptionist:
                 return line.split("Company Name:")[1].strip()
         return "our company"
 
-    def _base_system_prompt(self):
-        return (
-            f"Du bist eine warmherzige, professionelle Telefon-Rezeptionist:in für {self._company_name()}.\n"
-            f"--- BUSINESS INFORMATION ---\n{self.business_info}\n"
-            f"----------------------------\n"
-            "Verhalten:\n"
-            "• Sprich natürlich und prägnant wie eine menschliche Empfangskraft.\n"
-            "• Antworte in kurzen, klaren Sätzen (max. 12 Wörter). Teile längere Gedanken in mehrere kurze Sätze.\n"
-            "• Frage immer nur das Nächstnötige; stelle nichts erneut, was schon beantwortet wurde.\n"
-            "• Erhebe – sofern relevant – den Namen der anrufenden Person sowie eine Rückrufnummer, aber jeweils nur einmal.\n"
-            "• Wenn Informationen fehlen, biete die nächstliegende gültige Aktion an. Keine Erfindungen.\n"
-            "• Nicht erneut begrüßen, wenn bereits gegrüßt.\n"
-            "• Postadressen: „Straße Hausnummer, PLZ Stadt“. Nie PLZ an Hausnummer hängen.\n"
-            "• „E-Mail-Adresse“ nur für E-Mail; „Adresse/Anschrift“ ist Postadresse.\n"
-            "• Gegen Ende kurze, natürliche Abschlussfrage. Kein Antwort? Höflich beenden.\n"
-            "• Sprich konsequent auf Deutsch.\n"
-        )
-
     def make_asr(self):
         key, region = os.getenv("AZURE_SPEECH_KEY"), os.getenv("AZURE_SPEECH_REGION")
         if not key or not region:
@@ -104,10 +128,15 @@ class LowLatencyReceptionist:
         push_stream = speechsdk.audio.PushAudioInputStream(fmt)
         audio_in = speechsdk.audio.AudioConfig(stream=push_stream)
         recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_in)
+
+        # CUSTOM_PHRASES ONLY from env
         try:
-            phrase_list = speechsdk.PhraseListGrammar.from_recognizer(recognizer)
-            for phrase in CUSTOM_PHRASES:
-                phrase_list.addPhrase(phrase)
+            phrases = _parse_env_list("CUSTOM_PHRASES")
+            logger.info(f"[ASR] Loaded {len(phrases)} custom phrases: {phrases[:10]}")
+            if phrases:
+                phrase_list = speechsdk.PhraseListGrammar.from_recognizer(recognizer)
+                for p in phrases:
+                    phrase_list.addPhrase(p)
         except Exception as e:
             logger.warning(f"Could not add custom phrases to ASR: {e}")
         return recognizer, push_stream
@@ -132,39 +161,111 @@ _NUM_WORD = {"zero":"0","oh":"0","o":"0","one":"1","two":"2","three":"3","four":
 _SEP_WORDS = {"dash","hyphen","space","dot","point"}
 _PLUS_WORDS = {"plus"}
 _REPEAT_WORDS = {"double": 2, "triple": 3}
+
+# Support EN + DE name statements
 NAME_PATTERNS = [
-    re.compile(r"\bmy name is\s+([A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,2})\b(?!\s*(?:and|my|number|is|phone|contact|,|\.))", re.I),
-    re.compile(r"\bthis is\s+([A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,2})\b(?!\s*(?:and|my|number|is|phone|contact|,|\.))", re.I),
-    re.compile(r"\bI am\s+([A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,2})\b(?!\s*(?:and|my|number|is|phone|contact|,|\.))", re.I),
+    re.compile(r"\bmy name is\s+([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß'\-]+(?:\s+[A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß'\-]+){0,2})\b(?!\s*(?:and|my|number|is|phone|contact|,|\.))", re.I),
+    re.compile(r"\bthis is\s+([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß'\-]+(?:\s+[A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß'\-]+){0,2})\b(?!\s*(?:and|my|number|is|phone|contact|,|\.))", re.I),
+    re.compile(r"\bI am\s+([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß'\-]+(?:\s+[A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß'\-]+){0,2})\b(?!\s*(?:and|my|number|is|phone|contact|,|\.))", re.I),
+    re.compile(r"\b(?:mein name ist|ich hei(?:s|ß)e)\s+([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß'\-]+(?:\s+[A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß'\-]+){0,2})\b", re.I),
 ]
+
 PLZ_RE = re.compile(r'\b(?:D-)?(?P<plz>\d{5})\b')
 _STREET_SUFFIX_ALT = r'(straße|strasse|str\.|weg|allee|platz|ring|gasse|ufer|damm|kai|markt|stieg|steig|pfad|chaussee)'
 STREET_EMBED_RE = re.compile(rf'\b(?P<street>[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-.]*?(?:{_STREET_SUFFIX_ALT}))\b', re.IGNORECASE)
 STREET_SPACED_RE = re.compile(rf'\b(?P<street>(?:[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-.]+(?:\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-.]+)*)\s+{_STREET_SUFFIX_ALT})\b', re.IGNORECASE)
 HOUSE_AFTER_RE = re.compile(r'\s+(?P<house>\d+[A-Za-z]?(?:-\d+[A-Za-z]?)?)(?!\d)')
 EMAIL_TEXT_RE = re.compile(r'\b([A-Za-z0-9._%+\-]+)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})\b')
-_PHONE_CUE = re.compile(r"(my|the|a)?\s*(phone|number|mobile|cell|contact|reach me|call me|callback|call\-back)\s*(is|:)?", re.I)
+
+# Include German phone cues
+_PHONE_CUE = re.compile(r"(my|the|a|meine|mein)?\s*(phone|number|mobile|cell|contact|reach me|call me|callback|call\-back|telefonnummer|rufnummer|handy|nummer)\s*(is|ist|:)?", re.I)
 
 _STREET_SUFFIX = r'(straße|strasse|str\.|weg|allee|platz|ring|gasse|ufer|damm|kai|markt|stieg|steig|pfad|chaussee)'
 STREET_RE = re.compile(rf'\b(?P<street>[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-.]+(?:\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-.]+)*\s+{_STREET_SUFFIX})\s+(?P<house>\d+[A-Za-z]?(\-\d+[A-Za-z]?)?)\b')
 PLZ_CITY_RE = re.compile(r'\b(?:D-)?(?P<plz>\d{5})\s*[, ]\s*(?P<city>[A-Za-zÄÖÜäöüß\-.]+(?:\s+[A-Za-zÄÖÜäöüß\-.]+)*)\b', re.IGNORECASE)
 
+# --- NEW: lightweight update intent detection (EN + DE) ---
+_UPDATE_CUE = re.compile(
+    r"\b(update|change|correct|wrong|actually|new|neu|ändern|geändert|korrigier|korrektur|richtig|falsch|statt|jetzt|neue[rn]?|neues)\b",
+    re.IGNORECASE
+)
+def _wants_update(text: str) -> bool:
+    t = (text or "")
+    if _UPDATE_CUE.search(t):
+        return True
+    # direct declaratives often imply setting/overwriting
+    return bool(re.search(r"(my name is|mein name ist|ich hei(?:s|ß)e|my number is|meine (?:telefon)?nummer ist|my email is|meine e[\-\s]?mail ist|my address is|meine adresse ist)", t, re.IGNORECASE))
+
+def _set_field(contact: dict, key: str, new_val: Optional[str], *, override: bool, label: str):
+    if not new_val:
+        return
+    old = contact.get(key)
+    if old and not override and old == new_val:
+        return
+    if old and not override and old != new_val:
+        # If user didn't clearly signal update, keep first unless new looks clearly intended (e.g., longer)
+        if len(new_val) + 1 < len(old):
+            return
+    contact[key] = new_val
+    if old and old != new_val:
+        logger.info(f"[MEM] updated {label}: {old} -> {new_val}")
+    else:
+        logger.info(f"[MEM] captured {label}: {new_val}")
+
 def _norm_strasse_case(s: str) -> str:
     return re.sub(r'(?i)strasse\b', 'straße', s)
 
+# ---- NEW: Excel append helper ----
+def _append_record_excel(name: str, phone: str, path: str = "Record.xlsx"):
+    if not OPENPYXL_AVAILABLE:
+        logger.error("[Excel] openpyxl not available; cannot write Record.xlsx")
+        return
+    try:
+        if os.path.exists(path):
+            wb = load_workbook(path)
+            ws = wb.active
+            # If first row is empty or different headers, ensure headers exist once
+            if ws.max_row == 0 or (ws.max_row == 1 and (ws.cell(row=1, column=1).value is None)):
+                ws.cell(row=1, column=1, value="Name")
+                ws.cell(row=1, column=2, value="Number")
+        else:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Sheet1"
+            ws.cell(row=1, column=1, value="Name")
+            ws.cell(row=1, column=2, value="Number")
+        ws.append([name, phone])
+        wb.save(path)
+        logger.info(f"[Excel] Appended to {path}: {name} | {phone}")
+    except Exception as e:
+        logger.error(f"[Excel] Failed to write Record.xlsx: {e}")
+
 def extract_address(user_text: str, call_state: dict):
-    if not user_text or "@" in user_text: return
-    addr = call_state["contact"].setdefault("address", {"street": None, "house": None, "postal": None, "city": None})
+    if not user_text or "@" in user_text:
+        return
+    override = _wants_update(user_text)
+    contact = call_state["contact"]
+    addr = contact.setdefault("address", {"street": None, "house": None, "postal": None, "city": None})
+
+    # If explicit update/correction – start fresh
+    if override:
+        addr.update({"street": None, "house": None, "postal": None, "city": None})
+
     txt = _norm_strasse_case(user_text.strip())
+
+    # PLZ + optional city (any order)
     plz_match = PLZ_RE.search(txt)
     work = txt
     if plz_match:
         addr["postal"] = plz_match.group("plz")
         work = txt[:plz_match.start()] + ' ' + txt[plz_match.end():]
-    plz_city = re.search(r'\b(?:D-)?(\d{5})\s*[, ]\s*([A-Za-zÄÖÜäöüß\-.]+(?:\s+[A-Za-zÄÖÜäöüß\-.]+)*)\b', txt, re.IGNORECASE)
+
+    plz_city = PLZ_CITY_RE.search(txt)
     if plz_city:
-        addr["postal"] = plz_city.group(1)
-        addr["city"]   = plz_city.group(2).strip().title()
+        addr["postal"] = plz_city.group("plz")
+        addr["city"]   = plz_city.group("city").strip().title()
+
+    # If we know postal but not city, try infer next word(s)
     if addr.get("postal") and not addr.get("city"):
         tokens = re.findall(r'[A-Za-zÄÖÜäöüß\-.]+|\d{5}', txt)
         if addr["postal"] in tokens:
@@ -175,19 +276,25 @@ def extract_address(user_text: str, call_state: dict):
                 while j < len(tokens) and tokens[j][0].isalpha():
                     city_guess += " " + tokens[j]; j += 1
                 addr["city"] = city_guess.title()
-    if not addr["street"]:
+
+    # Street + house
+    if not addr.get("street") or override:
         m = STREET_EMBED_RE.search(work) or STREET_SPACED_RE.search(work)
         if m:
             addr["street"] = _norm_strasse_case(m.group("street")).strip()
             tail = work[m.end():]
             h = HOUSE_AFTER_RE.match(tail)
             if h: addr["house"] = h.group("house")
-    if addr.get("street") and not addr.get("house"):
+
+    # If street known but house missing, try after street
+    if addr.get("street") and (not addr.get("house") or override):
         mstreet = re.search(re.escape(addr["street"]), txt, re.IGNORECASE)
         if mstreet:
             after = txt[mstreet.end():]
             mhouse = re.search(r'\b(\d+[A-Za-z]?(?:-\d+[A-Za-z]?)?)\b(?!\s*\d)', after)
             if mhouse: addr["house"] = mhouse.group(1)
+
+    # Untangle house vs postal mashups
     if addr.get("house"):
         if re.fullmatch(r'\d{6,}', addr["house"]):
             if not addr.get("postal"): addr["postal"] = addr["house"][-5:]
@@ -197,6 +304,7 @@ def extract_address(user_text: str, call_state: dict):
             if not addr.get("postal"): addr["postal"] = m.group(2)
             addr["house"] = m.group(1)
     if addr.get("house") == "": addr["house"] = None
+
     logger.info(f"[MEM] address now: {addr}")
 
 def _looks_like_phone_utterance(text: str) -> bool:
@@ -212,17 +320,25 @@ def _normalize_numeric_candidate(s: str, *, allow_short: bool) -> Optional[str]:
     return ("+" if lead_plus else "") + digits
 
 def _spoken_to_digits(text: str, *, allow_short: bool) -> Optional[str]:
-    toks = re.findall(r"[a-zA-Z]+|\d+|\+|[\-().]", (text or "").lower())
+    toks = re.findall(r"[a-zA-ZÄÖÜäöüß]+|\d+|\+|[\-().]", (text or "").lower())
+    # include German digit words
+    de_map = {
+        "null":"0","eins":"1","ein":"1","zwei":"2","drei":"3","vier":"4","fünf":"5","funf":"5","sechs":"6",
+        "sieben":"7","acht":"8","neun":"9","zehn":"10" # only single-digit used
+    }
+    num_map = {**_NUM_WORD, **de_map}
     out, lead_plus, i = [], False, 0
     while i < len(toks):
         t = toks[i]
         if t in _PLUS_WORDS or t == "+": lead_plus = True; i += 1; continue
         if t in _SEP_WORDS or t in {"-", "(", ")", "."}: i += 1; continue
         if t in _REPEAT_WORDS and (i + 1) < len(toks):
-            nxt = toks[i+1]; d = _NUM_WORD.get(nxt)
-            if d: out.extend(d * _REPEAT_WORDS[t]); i += 2; continue
-        d = _NUM_WORD.get(t)
-        if d: out.append(d); i += 1; continue
+            nxt = toks[i+1]; d = num_map.get(nxt)
+            if d and len(d) == 1: out.extend(d * _REPEAT_WORDS[t]); i += 2; continue
+        d = num_map.get(t)
+        if d:
+            out.extend(list(d))
+            i += 1; continue
         if t.isdigit(): out.extend(list(t)); i += 1; continue
         i += 1
     digits = "".join(out)
@@ -231,34 +347,61 @@ def _spoken_to_digits(text: str, *, allow_short: bool) -> Optional[str]:
     return None
 
 def _clean_name(name: str) -> str:
-    name = re.split(r"\b(?:and|my|number|is|phone|contact)\b|[,\.]", name, 1, flags=re.I)[0].strip()
+    name = re.split(r"\b(?:and|my|number|is|phone|contact|mein|meine|nummer|telefonnummer)\b|[,\.]", name, 1, flags=re.I)[0].strip()
     parts = [p for p in name.split() if p][:3]
     return " ".join(w[0:1].upper() + w[1:] for w in parts)
 
 def extract_contact(user_text: str, call_state: dict):
     if not user_text: return
-    if not call_state["contact"].get("email"):
-        m = EMAIL_TEXT_RE.search(user_text)
-        if m:
-            email = (m.group(1) + "@" + m.group(2)).lower()
-            call_state["contact"]["email"] = email
-            logger.info(f"[MEM] captured email: {email}")
-    allow_short = _looks_like_phone_utterance(user_text)
-    if not call_state["contact"].get("phone"):
-        for cand in INTL_PHONE_CANDIDATE.findall(user_text):
-            norm = _normalize_numeric_candidate(cand, allow_short=allow_short)
-            if norm: call_state["contact"]["phone"] = norm; logger.info(f"[MEM] captured phone (numeric): {norm}"); break
-    if not call_state["contact"].get("phone"):
+    contact = call_state["contact"]
+    override = _wants_update(user_text)
+
+    # Email (update if cue or empty or different)
+    m = EMAIL_TEXT_RE.search(user_text)
+    if m:
+        email = (m.group(1) + "@" + m.group(2)).lower()
+        _set_field(contact, "email", email, override=override or not contact.get("email"), label="email")
+
+    # Phone
+    allow_short = _looks_like_phone_utterance(user_text) or override
+    # numeric form in text
+    for cand in INTL_PHONE_CANDIDATE.findall(user_text):
+        norm = _normalize_numeric_candidate(cand, allow_short=allow_short)
+        if norm:
+            _set_field(contact, "phone", norm, override=override or not contact.get("phone"), label="phone")
+            break
+    # spoken digits
+    if not contact.get("phone") or override:
         spoken = _spoken_to_digits(user_text, allow_short=allow_short)
-        if spoken: call_state["contact"]["phone"] = spoken; logger.info(f"[MEM] captured phone (spoken): {spoken}")
-    if not call_state["contact"].get("name"):
-        for pat in NAME_PATTERNS:
-            m = pat.search(user_text)
-            if m:
-                raw = m.group(1).strip(); name = _clean_name(raw)
-                if name: call_state["contact"]["name"] = name; logger.info(f"[MEM] captured name: {name}"); break
+        if spoken:
+            _set_field(contact, "phone", spoken, override=override or not contact.get("phone"), label="phone")
+
+    # Name
+    for pat in NAME_PATTERNS:
+        m = pat.search(user_text)
+        if m:
+            raw = m.group(1).strip(); name = _clean_name(raw)
+            if name:
+                _set_field(contact, "name", name, override=override or not contact.get("name"), label="name")
+                break
+
+    # ---- NEW: Save to Excel when we have both name and phone, avoiding duplicates per call ----
+    try:
+        name = contact.get("name")
+        phone = contact.get("phone")
+        if name and phone:
+            last = call_state.get("meta", {}).get("last_saved_pair")
+            pair = (name, phone)
+            if last != pair:
+                _append_record_excel(name, phone)  # creates Record.xlsx if missing, else appends
+                call_state["meta"]["last_saved_pair"] = pair
+    except Exception as e:
+        logger.error(f"[Excel] save attempt failed: {e}")
 
 def build_system_prompt_with_memory(call_state: dict) -> str:
+    # Base system prompt is ONLY from env (already expanded with business info)
+    base = state.base_system_prompt or ""
+
     name = call_state["contact"].get("name")
     phone = call_state["contact"].get("phone")
     greeted = call_state["meta"].get("greeted")
@@ -287,7 +430,7 @@ def build_system_prompt_with_memory(call_state: dict) -> str:
         closing_hint,
         "- Postadresse: " + pretty,
     ]
-    return state.base_system_prompt + "\n" + "\n".join([m for m in memory if m is not None]) + "\n"
+    return (base + "\n" if base else "") + "\n".join([m for m in memory if m is not None]) + "\n"
 
 # ---------- LLM streaming ----------
 _SENTENCE_END = re.compile(r'([.!?])(\s|$)')
@@ -309,7 +452,7 @@ async def llm_stream_sentences(history, user_text, call_state):
     try:
         async with httpx_client.stream(
             "POST", "https://api.openai.com/v1/chat/completions",
-            json={"model": "gpt-4o-mini", "messages": messages, "temperature": 0.4, "max_tokens": 220, "stream": True},
+            json={"model": "gpt-4o-mini", "messages": messages, "temperature": 0.3, "max_tokens": 320, "stream": True},
         ) as r:
             r.raise_for_status()
             buf = ""; last_flush = time.perf_counter(); MAX_WAIT = 1.2; MIN_CHARS = 40
@@ -375,7 +518,7 @@ TIME_WITH_UHR_RE = re.compile(rf'(?<!\d)(?P<h>[01]?\d|2[0-3]){_WS}[:.]{_WS}(?P<m
 _HOUR = ["null","ein","zwei","drei","vier","fünf","sechs","sieben","acht","neun","zehn","elf","zwölf","dreizehn","vierzehn","fünfzehn","sechzehn","siebzehn","achtzehn","neunzehn","zwanzig","einundzwanzig","zweiundzwanzig","dreiundzwanzig","vierundzwanzig"]
 _ONES = ["null","eins","zwei","drei","vier","fünf","sechs","sieben","acht","neun"]
 _TENS = ["","zehn","zwanzig","dreißig","vierzig","fünfzig"]
-_SPECIAL = {10:"zehn",11:"elf",12:"zwölf",13:"dreizehn",14:"vierzehn",15:"fünfzehn",16:"sechzehn",17:"siebzehn",18:"achtzehn",19:"neunzehn"}
+_SPECIAL = {10:"zehn",11:"elf",12:"zwölf",13:"dreizehn",14:"vierzehn",15:"fünfzehn",16:"sechzehn",17:"achtzehn",19:"neunzehn"}
 
 def _min_words(n: int) -> str:
     if n == 0: return ""
@@ -554,8 +697,7 @@ async def media():
     logger.info("WebSocket connected.")
     stream_sid = None
 
-    # Build base URL for TwiML redirect fallback
-# Build base URL for TwiML redirect fallback (no request context in WS!)
+    # Build base URL for TwiML redirect fallback (no request context in WS!)
     app_base_url = os.getenv("APP_BASE_URL")
     if not app_base_url:
         # Prefer Host header from the websocket, else Azure's WEBSITE_HOSTNAME
@@ -568,11 +710,19 @@ async def media():
             app_base_url = f"https://{host}"
     logger.info(f"[WS] app_base_url set to {app_base_url}")
 
-
     # Per-call state
     history = []
     greeted = False
-    call_state = {"contact": {"name": None, "phone": None}, "meta": {"greeted": False}}
+    # --- INIT UPDATED: include email + full address container ---
+    call_state = {
+        "contact": {
+            "name": None,
+            "phone": None,
+            "email": None,
+            "address": {"street": None, "house": None, "postal": None, "city": None}
+        },
+        "meta": {"greeted": False, "last_saved_pair": None}  # <-- NEW: track last saved (name, phone)
+    }
 
     # Turn control
     current_turn = {"id": 0}
@@ -596,7 +746,7 @@ async def media():
     last_bot_asked_question = False
     last_assistant_sentence_ms = time.time() * 1000.0
     interaction_started = False
-    # NEW: only allow hangup after the caller has spoken once
+    # Only allow hangup after the caller has spoken once
     allow_hangup = False
 
     smooth_task: Optional[asyncio.Task] = None
@@ -683,7 +833,6 @@ async def media():
                     try: await websocket.send(json.dumps({"event": "mark", "streamSid": stream_sid, "mark": {"name": "tts-end"}}))
                     except Exception: pass
 
-                # Hangup only if caller has spoken at least once (allow_hangup=True)
                 if says_goodbye(text) and item_turn == current_turn["id"]:
                     if allow_hangup:
                         logger.info("[HANGUP] Goodbye phrase spoken; ending call (armed).")
@@ -718,8 +867,8 @@ async def media():
         nonlocal llm_task, tts_cancel, interaction_started, allow_hangup
         while True:
             user_text = await final_queue.get()
-            # Arm hangup as soon as the caller has spoken once
             allow_hangup = True
+            # --- capture/update contact info every user final ---
             extract_contact(user_text, call_state); extract_address(user_text, call_state)
             current_turn["id"] += 1; turn_id = current_turn["id"]; interaction_started = True
             logger.info(f"[Caller] {user_text} | MEM: {call_state['contact']} | hangup_armed={allow_hangup}")
@@ -764,18 +913,17 @@ async def media():
                 if not greeted:
                     greeted = True; call_state["meta"]["greeted"] = True
                     current_turn["id"] += 1
-                    await tts_queue.put((current_turn["id"],
-                        "Willkommen beim GEGENWIND AI-Rezeptionsassistenten. "
-                        "Haben sie ein Holland-Rad oder möchten sie nur Reifen wechseln? Dann sind wir leider nicht die richtige Werkstatt für sie. "
-                        "Jetzt können Sie Fragen stellen, einen Termin vereinbaren, "
-                        "einen Rückruf anfordern, oder Öffnungszeiten/Adresse erfahren. Womit kann ich helfen?"
-                    ))
+                    # GREETING only from env; if unset -> skip with warning
+                    greeting_text = _env_text("GREETING")
+                    if greeting_text and greeting_text.strip():
+                        await tts_queue.put((current_turn["id"], greeting_text))
+                    else:
+                        logger.warning("GREETING not set in environment; skipping initial spoken greeting.")
 
             elif event == "media":
                 b64 = msg["media"]["payload"]
                 pcm16 = mulaw_b64_to_pcm16_bytes(b64)
                 await asyncio.to_thread(push_stream.write, pcm16)
-                last_user_media_ms = time.time() * 1000.0
                 if is_speech(pcm16):
                     speech_streak_frames = min(10, speech_streak_frames + 1)
                 else:
