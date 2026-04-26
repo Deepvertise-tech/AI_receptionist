@@ -1,4 +1,6 @@
 import os, json, base64, logging, asyncio, time, struct, re, html, unicodedata
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional
 from dotenv import load_dotenv
 from quart import Quart, request, websocket
@@ -6,7 +8,7 @@ from twilio.twiml.voice_response import VoiceResponse
 import azure.cognitiveservices.speech as speechsdk
 import httpx
 
-# ---- NEW: Excel (OpenPyXL) support ----
+# ---- Excel (OpenPyXL) support ----
 try:
     from openpyxl import Workbook, load_workbook
     OPENPYXL_AVAILABLE = True
@@ -88,6 +90,7 @@ def _parse_env_list(var_name: str):
 class LowLatencyReceptionist:
     def __init__(self):
         self.business_info = self._load_business_info()
+        self.business_info = self._inject_dynamic_date_context(self.business_info)
 
         # Optional clamp to avoid very large prompts hurting latency
         MAX_BIZ = int(os.getenv("BUSINESS_INFO_MAX_CHARS", "12000"))
@@ -107,8 +110,52 @@ class LowLatencyReceptionist:
         try:
             with open(fn, "r", encoding="utf-8") as f:
                 return f.read()
-        except:
+        except Exception as e:
+            logger.error(f"[BUSINESS_INFO] Failed to load {fn}: {e}")
             return "Business information not available."
+
+    def _inject_dynamic_date_context(self, text: str) -> str:
+        """
+        Replace the 'Appointment availability:' line in business_info with
+        dynamic dates based on today's date in Munich.
+
+        We do NOT allow same-day appointments: the first date is at least
+        three business days in the future (respecting weekends), then the
+        following two business days.
+        """
+        try:
+            tz = ZoneInfo("Europe/Berlin")
+        except Exception:
+            tz = None
+
+        today = datetime.now(tz).date() if tz else datetime.now().date()
+
+        def _next_business_day(d):
+            # 0=Monday, 6=Sunday; skip Saturday/Sunday
+            while d.weekday() >= 5:
+                d += timedelta(days=1)
+            return d
+
+        # Earliest slot: at least 3 business days ahead of "today"
+        base = today + timedelta(days=3)
+        d1 = _next_business_day(base)
+        d2 = _next_business_day(d1 + timedelta(days=1))
+        d3 = _next_business_day(d2 + timedelta(days=1))
+
+        def _fmt(d):
+            # Example: "Tuesday 24 February 2026"
+            return d.strftime("%A %d %B %Y")
+
+        new_line = (
+            "Appointment availability: "
+            f"{_fmt(d1)}, {_fmt(d2)}, {_fmt(d3)}"
+        )
+
+        # If the marker line exists, replace it; otherwise append at the end.
+        if "Appointment availability:" in text:
+            return re.sub(r"Appointment availability:.*", new_line, text)
+        else:
+            return text.rstrip() + "\n" + new_line + "\n"
 
     def _company_name(self):
         for line in self.business_info.splitlines():
@@ -149,11 +196,12 @@ class LowLatencyReceptionist:
         speech_config.set_speech_synthesis_output_format(
             speechsdk.SpeechSynthesisOutputFormat.Raw8Khz8BitMonoMULaw
         )
-        speech_config.speech_synthesis_voice_name = os.getenv("AZURE_TTS_VOICE", "de-DE-AmalaNeural")
+        speech_config.speech_synthesis_voice_name = os.getenv("AZURE_TTS_VOICE", "de-DE-KatjaNeural")
         synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
         return synthesizer
 
 state = LowLatencyReceptionist()
+
 
 # ---------- Contact & address extraction ----------
 INTL_PHONE_CANDIDATE = re.compile(r'(\+?\d[\d\s().-]{2,}\d)')
@@ -562,7 +610,7 @@ def _normalize_bullets(text: str) -> str:
     return "\n".join(repl(l) for l in text.splitlines())
 
 def auto_ssml(text: str, lang="de-DE", voice=None) -> str:
-    voice = voice or os.getenv("AZURE_TTS_VOICE", "de-DE-AmalaNeural")
+    voice = voice or os.getenv("AZURE_TTS_VOICE", "de-DE-KatjaNeural")
     rate = os.getenv("AZURE_TTS_RATE", "+25%")
     gap_ms = int(os.getenv("AZURE_TTS_SENTENCE_GAP_MS", "40"))
     if not text: text = ""
